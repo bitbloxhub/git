@@ -1120,9 +1120,16 @@ static int run_command_silent_on_success(struct child_process *cmd)
 static int run_git_commit(const char *defmsg,
 			  const char *reflog_action,
 			  struct replay_opts *opts,
+			  struct commit_extra_header *extra,
 			  unsigned int flags)
 {
+	struct strbuf header_strbuf = STRBUF_INIT;
 	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct strbuf extra_header_file_path = STRBUF_INIT;
+	int extra_header_file_path_fd;
+	strbuf_addstr(&extra_header_file_path, "/tmp/extra_header_file.XXXXXX");
+	extra_header_file_path_fd = xmkstemp(extra_header_file_path.buf);
+	close(extra_header_file_path_fd);
 
 	cmd.git_cmd = 1;
 
@@ -1174,6 +1181,20 @@ static int run_git_commit(const char *defmsg,
 
 	if (!(flags & EDIT_MSG))
 		strvec_push(&cmd.args, "--allow-empty-message");
+
+	strvec_pushl(&cmd.args, "--extra-commit-header-file", extra_header_file_path.buf, NULL);
+
+	while (extra) {
+		add_extra_header(&header_strbuf, extra);
+		extra = extra->next;
+	}
+
+	FILE *extra_header_file = xfopen(extra_header_file_path.buf, "w");
+	fputs(header_strbuf.buf, extra_header_file);
+	fflush(extra_header_file);
+	fclose(extra_header_file);
+
+	strbuf_release(&header_strbuf);
 
 	if (is_rebase_i(opts) && !(flags & EDIT_MSG))
 		return run_command_silent_on_success(&cmd);
@@ -1520,8 +1541,9 @@ static int try_to_commit(struct repository *r,
 			 struct strbuf *msg, const char *author,
 			 const char *reflog_action,
 			 struct replay_opts *opts, unsigned int flags,
-			 struct object_id *oid)
+			 struct commit *source_commit, struct object_id *oid)
 {
+	const char *exclude_gpgsig[] = { "gpgsig", "gpgsig-sha256", NULL };
 	struct object_id tree;
 	struct commit *current_head = NULL;
 	struct commit_list *parents = NULL;
@@ -1537,8 +1559,11 @@ static int try_to_commit(struct repository *r,
 	if (parse_head(r, &current_head))
 		return -1;
 
+	if (!(flags & AMEND_MSG) && source_commit) {
+		extra = read_commit_extra_headers(source_commit, exclude_gpgsig);
+	}
 	if (flags & AMEND_MSG) {
-		const char *exclude_gpgsig[] = { "gpgsig", "gpgsig-sha256", NULL };
+		extra = read_commit_extra_headers(current_head, exclude_gpgsig);
 		const char *out_enc = get_commit_output_encoding();
 		const char *message = repo_logmsg_reencode(r, current_head,
 							   NULL, out_enc);
@@ -1559,7 +1584,6 @@ static int try_to_commit(struct repository *r,
 			goto out;
 		}
 		parents = copy_commit_list(current_head->parents);
-		extra = read_commit_extra_headers(current_head, exclude_gpgsig);
 	} else if (current_head &&
 		   (!(flags & CREATE_ROOT_COMMIT) || (flags & AMEND_MSG))) {
 		commit_list_insert(current_head, &parents);
@@ -1711,12 +1735,15 @@ static int do_commit(struct repository *r,
 		     const char *msg_file, const char *author,
 		     const char *reflog_action,
 		     struct replay_opts *opts, unsigned int flags,
-		     struct object_id *oid)
+		     struct object_id *original_oid)
 {
+	const char *exclude_gpgsig[] = { "gpgsig", "gpgsig-sha256", NULL };
+	struct commit_extra_header *extra = NULL;
+	struct commit *source_commit = NULL;
 	int res = 1;
 
 	if (!(flags & EDIT_MSG) && !(flags & VERIFY_MSG)) {
-		struct object_id oid;
+		struct object_id new_oid;
 		struct strbuf sb = STRBUF_INIT;
 
 		if (msg_file && strbuf_read_file(&sb, msg_file, 2048) < 0)
@@ -1724,26 +1751,37 @@ static int do_commit(struct repository *r,
 					     "from '%s'"),
 					   msg_file);
 
+		if (!(flags & AMEND_MSG) && original_oid) {
+			source_commit = lookup_commit_reference(r, original_oid);
+			if (source_commit) {
+				extra = read_commit_extra_headers(source_commit, exclude_gpgsig);
+			}
+		}
+
 		res = try_to_commit(r, msg_file ? &sb : NULL,
-				    author, reflog_action, opts, flags, &oid);
+				    author, reflog_action, opts, flags, source_commit, &new_oid);
 		strbuf_release(&sb);
 		if (!res) {
 			refs_delete_ref(get_main_ref_store(r), "",
 					"CHERRY_PICK_HEAD", NULL, REF_NO_DEREF);
 			unlink(git_path_merge_msg(r));
 			if (!is_rebase_i(opts))
-				print_commit_summary(r, NULL, &oid,
+				print_commit_summary(r, NULL, &new_oid,
 						SUMMARY_SHOW_AUTHOR_DATE);
+			free_commit_extra_headers(extra);
 			return res;
 		}
 	}
 	if (res == 1) {
-		if (is_rebase_i(opts) && oid)
-			if (write_rebase_head(oid))
+		if (is_rebase_i(opts) && original_oid)
+			if (write_rebase_head(original_oid))
 			    return -1;
-		return run_git_commit(msg_file, reflog_action, opts, flags);
+		res = run_git_commit(msg_file, reflog_action, opts, extra, flags);
+		free_commit_extra_headers(extra);
+		return res;
 	}
 
+	free_commit_extra_headers(extra);
 	return res;
 }
 
@@ -2535,7 +2573,7 @@ fast_forward_edit:
 			 * got here.
 			 */
 			flags = EDIT_MSG | VERIFY_MSG | AMEND_MSG | ALLOW_EMPTY;
-			res = run_git_commit(NULL, reflog_action, opts, flags);
+			res = run_git_commit(NULL, reflog_action, opts, NULL, flags);
 			*check_todo = 1;
 		}
 	}
@@ -4071,6 +4109,7 @@ static int do_merge(struct repository *r,
 		    const char *arg, int arg_len,
 		    int flags, int *check_todo, struct replay_opts *opts)
 {
+	const char *exclude_gpgsig[] = { "gpgsig", "gpgsig-sha256", NULL };
 	struct replay_ctx *ctx = opts->ctx;
 	int run_commit_flags = 0;
 	struct strbuf ref_name = STRBUF_INIT;
@@ -4087,6 +4126,10 @@ static int do_merge(struct repository *r,
 	static struct lock_file lock;
 	const char *p;
 	const char *reflog_action = reflog_message(opts, "merge", NULL);
+	struct commit_extra_header *extra = NULL;
+	if (commit) {
+		extra = read_commit_extra_headers(commit, exclude_gpgsig);
+	}
 
 	if (repo_hold_locked_index(r, &lock, LOCK_REPORT_ON_ERROR) < 0) {
 		ret = -1;
@@ -4359,13 +4402,13 @@ static int do_merge(struct repository *r,
 		 * command needs to be rescheduled).
 		 */
 		ret = !!run_git_commit(git_path_merge_msg(r), reflog_action,
-				       opts, run_commit_flags);
+				       opts, extra, run_commit_flags);
 
 	if (!ret && flags & TODO_EDIT_MERGE_MSG) {
 	fast_forward_edit:
 		*check_todo = 1;
 		run_commit_flags |= AMEND_MSG | EDIT_MSG | VERIFY_MSG;
-		ret = !!run_git_commit(NULL, reflog_action, opts,
+		ret = !!run_git_commit(NULL, reflog_action, opts, extra,
 				       run_commit_flags);
 	}
 
@@ -5196,8 +5239,11 @@ static int continue_single_pick(struct repository *r, struct replay_opts *opts)
 
 static int commit_staged_changes(struct repository *r,
 				 struct replay_opts *opts,
-				 struct todo_list *todo_list)
+				 struct todo_list *todo_list,
+				 struct commit *commit)
 {
+	const char *exclude_gpgsig[] = { "gpgsig", "gpgsig-sha256", NULL };
+	struct commit_extra_header *extra = NULL;
 	struct replay_ctx *ctx = opts->ctx;
 	unsigned int flags = ALLOW_EMPTY | EDIT_MSG;
 	unsigned int final_fixup = 0, is_clean;
@@ -5364,8 +5410,10 @@ static int commit_staged_changes(struct repository *r,
 		}
 	}
 
+	extra = read_commit_extra_headers(commit, exclude_gpgsig);
+
 	if (run_git_commit(final_fixup ? NULL : rebase_path_message(),
-			   reflog_action, opts, flags)) {
+			   reflog_action, opts, extra, flags)) {
 		ret = error(_("could not commit staged changes."));
 		goto out;
 	}
@@ -5417,7 +5465,14 @@ int sequencer_continue(struct repository *r, struct replay_opts *opts)
 			unlink(rebase_path_dropped());
 		}
 
-		if (commit_staged_changes(r, opts, &todo_list)) {
+		struct strbuf stopped_sha = STRBUF_INIT;
+		if (file_exists(rebase_path_stopped_sha())) {
+			read_oneliner(&stopped_sha, rebase_path_stopped_sha(), READ_ONELINER_WARN_MISSING);
+		}
+		struct object_id stopped_sha_oid;
+		get_oid_hex(stopped_sha.buf, &stopped_sha_oid);
+
+		if (commit_staged_changes(r, opts, &todo_list, lookup_commit_object(r, &stopped_sha_oid))) {
 			res = -1;
 			goto release_todo_list;
 		}

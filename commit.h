@@ -281,7 +281,11 @@ int commit_tree_extended(const char *msg, size_t msg_len,
 			 const char *author, const char *committer,
 			 const char *sign_commit, const struct commit_extra_header *);
 
-struct commit_extra_header *read_commit_extra_headers(struct commit *, const char **);
+void add_extra_header(struct strbuf *buffer, const struct commit_extra_header *extra);
+
+struct commit_extra_header *read_commit_extra_header_lines(const char *buf, size_t len, const char **exclude);
+
+struct commit_extra_header *read_commit_extra_headers(struct commit *, const char **exclude);
 
 void free_commit_extra_headers(struct commit_extra_header *extra);
 

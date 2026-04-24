@@ -33,8 +33,6 @@
 #include "object-file-convert.h"
 #include "prio-queue.h"
 
-static struct commit_extra_header *read_commit_extra_header_lines(const char *buf, size_t len, const char **);
-
 int save_commit_buffer = 1;
 int no_graft_file_deprecated_advice;
 
@@ -1411,8 +1409,8 @@ static int convert_commit_extra_headers(const struct commit_extra_header *orig,
 	return 0;
 }
 
-static void add_extra_header(struct strbuf *buffer,
-			     const struct commit_extra_header *extra)
+void add_extra_header(struct strbuf *buffer,
+		      const struct commit_extra_header *extra)
 {
 	strbuf_addstr(buffer, extra->key);
 	if (extra->len)
@@ -1471,7 +1469,7 @@ static int excluded_header_field(const char *field, size_t len, const char **exc
 	return 0;
 }
 
-static struct commit_extra_header *read_commit_extra_header_lines(
+struct commit_extra_header *read_commit_extra_header_lines(
 	const char *buffer, size_t size,
 	const char **exclude)
 {

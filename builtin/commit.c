@@ -114,6 +114,8 @@ static enum {
 static const char *force_author;
 static char *logfile;
 static char *template_file;
+static char *extra_commit_header_file;
+
 /*
  * The _message variables are commit names from which to take
  * the commit message and/or authorship.
@@ -1773,6 +1775,7 @@ int cmd_commit(int argc,
 		},
 		OPT_PATHSPEC_FROM_FILE(&pathspec_from_file),
 		OPT_PATHSPEC_FILE_NUL(&pathspec_file_nul),
+		OPT_FILENAME(0, "extra-commit-header-file", &extra_commit_header_file, N_("take extra headers from this file")),
 		/* end commit contents options */
 
 		OPT_HIDDEN_BOOL(0, "allow-empty", &allow_empty,
@@ -1928,6 +1931,25 @@ int cmd_commit(int argc,
 	} else {
 		struct commit_extra_header **tail = &extra;
 		append_merge_tag_headers(parents, &tail);
+	}
+
+	if (extra_commit_header_file) {
+		FILE *extra_header_file = xfopen(extra_commit_header_file, "r");
+		struct strbuf extra_commit_headers = STRBUF_INIT;
+		strbuf_read(&extra_commit_headers, fileno(extra_header_file), 0);
+		struct commit_extra_header *extra_commit_headers_from_file = read_commit_extra_header_lines(extra_commit_headers.buf, extra_commit_headers.len, NULL);
+		struct commit_extra_header *extra_cursor = extra;
+		if (extra_cursor) {
+			while (true) {
+				if (extra_cursor->next == NULL) {
+					break;
+				}
+				extra_cursor = extra_cursor->next;
+			}
+			extra_cursor->next = extra_commit_headers_from_file;
+		} else {
+			extra = extra_commit_headers_from_file;
+		}
 	}
 
 	if (commit_tree_extended(sb.buf, sb.len, &the_repository->index->cache_tree->oid,
